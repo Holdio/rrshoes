@@ -3,18 +3,57 @@ from selenium.webdriver.support.ui import WebDriverWait
 from google.oauth2.service_account import Credentials
 from gspread_dataframe import set_with_dataframe
 from selenium.webdriver.common.by import By
+from email.message import EmailMessage
 import undetected_chromedriver as uc
 from collections import Counter
+from dotenv import load_dotenv
 from datetime import datetime
 import pandas as pd
+import traceback
 import requests
+import smtplib
 import gspread
 import random
 import time
-import math
 import json
 import re
+import os
 
+error_email_sent = False
+last_product = None
+
+def send_error_email(error_text, last_product=None):
+    load_dotenv("security.env")
+    email = os.getenv("USERNAME")
+    password = os.getenv("PASSWORD")
+    global error_email_sent
+
+    if error_email_sent:
+        return  # prevents duplicates
+
+    msg = EmailMessage()
+    msg["Subject"] = "Rack Room Scraper Crashed"
+    msg["From"] = email #Customize these for Hank's Email
+    msg["To"] = email #Customize these for Hank's Email
+
+    #The reason the scraper crashed
+    body = error_text
+
+    #The last item scraped before crashing
+    if last_product:
+        body += "\n\n--- LAST SCRAPED ITEM ---\n"
+        body += json.dumps(last_product, indent=2)
+
+    msg.set_content(body)
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(email, password)
+        smtp.send_message(msg)
+
+    #Sets a message that prevents email spam
+    error_email_sent = True
+
+#Coupon logic
 def apply_coupon(price, coupon):
     if coupon["type"] == "threshold_discount":
         if (price * 2) >= coupon["threshold"]:
@@ -26,7 +65,7 @@ def apply_coupon(price, coupon):
         return sale_price
 
     return price
-
+#Get what the discounts of the coupons are
 def parse_coupon(text):
     text = text.upper()
 
@@ -48,7 +87,7 @@ def parse_coupon(text):
         }
 
     return {"type": "unknown", "raw": text}
-
+#Understanding data logic
 def decode_custom_entities(s: str) -> str:
     return (
         s.replace("&q;", '"')
@@ -56,7 +95,7 @@ def decode_custom_entities(s: str) -> str:
          .replace("&g;", ">")
          .replace("&a;", "&")
     )
-
+#Helpful logic for finding information
 def find_key(data, target_key, path=""):
     if isinstance(data, dict):
         for key, value in data.items():
@@ -73,289 +112,241 @@ def find_key(data, target_key, path=""):
         for i, item in enumerate(data):
             find_key(item, target_key, f"{path}[{i}]")
 
-options = uc.ChromeOptions()
-options.add_argument("--window-size=1280,800")
-prefs = {"profile.managed_default_content_settings.images": 2}
-options.add_experimental_option("prefs", prefs)
 
-driver = uc.Chrome(version_main=147, options=options)
-
-accepted_brands = ["BROOKS", "NEW BALANCE", "ASICS", "JORDAN", "NIKE", "ADIDAS", "SKECHERS", "COLUMBIA", "MERRELL",
-                   "KEEN", "HOKA", "ON", "UNDER ARMOR", "REEBOK", "PUMA", "SOREL", "LIFESTRIDE", "TIMBERLAND"]
-
-shoe_data = []
-
-length = 30
-
-i = 0
-
-start_time = time.time()
-
-seen_texts = set()
-
-finish_time = time.time() + 20
-
-while length == 30:
-# while i == 0:
-
-    # Wait for products to appear
-    real_url = "https://www.rackroomshoes.com/search/?icid=20260211_RRS2026Events_Core&source=TLN_SalePage_Header&facetFilters=%255B%255B%2522categoryPageId%253Aonsale%2522%255D%255D&currentPage=" + str(i)
-
-    driver.get(real_url)
-
-    print(real_url)
-
-    wait = WebDriverWait(driver, 10)
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.mx-2")))
-
-    if i == 0:
-        try:
-            driver.implicitly_wait(8)
-
-            iframe = driver.find_element(By.ID, "lightbox-iframe-9e50d19b-40c1-4c94-9ca4-752b728e5569")
-
-            # Switch to the iframe
-            driver.switch_to.frame(iframe)
-
-            # Now you can interact with the modal close button
-            close_button = WebDriverWait(driver, 2).until(
-                EC.element_to_be_clickable((By.XPATH, "//*[@aria-label='Close Modal']"))
-            )
-            close_button.click()
-
-            # After interacting with the iframe, you may want to switch back to the main document
-            driver.switch_to.default_content()
-        except:
-            print("Error")
-
-        while time.time() < finish_time:
+def main():
+    #Sets up the webpage to get information from
+    options = uc.ChromeOptions()
+    options.add_argument("--window-size=1280,800")
+    prefs = {"profile.managed_default_content_settings.images": 2}
+    options.add_experimental_option("prefs", prefs)
+    driver = uc.Chrome(version_main=149, options=options)
+    #What brands are we scraping
+    accepted_brands = ["BROOKS", "NEW BALANCE", "ASICS", "JORDAN", "NIKE", "ADIDAS", "SKECHERS", "COLUMBIA", "MERRELL",
+                       "KEEN", "HOKA", "ON", "UNDER ARMOR", "REEBOK", "PUMA", "SOREL", "LIFESTRIDE", "TIMBERLAND"]
+    shoe_data = []
+    length = 30
+    i = 0
+    start_time = time.time()
+    seen_texts = set()
+    finish_time = time.time() + 30
+    #Keep scraping until we hit the end of the pages
+    while length == 30:
+        # Wait for products to appear
+        real_url = "https://www.rackroomshoes.com/search/?icid=20260211_RRS2026Events_Core&source=TLN_SalePage_Header&facetFilters=%255B%255B%2522categoryPageId%253Aonsale%2522%255D%255D&currentPage=" + str(i)
+        driver.get(real_url)
+        print(real_url)
+        wait = WebDriverWait(driver, 10)
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.mx-2")))
+        if i == 0:
             try:
-                el = driver.find_element(By.ID, "changeText")
-                text = el.text.strip()
+                #Close any popups
+                driver.implicitly_wait(8)
+                iframe = driver.find_element(By.ID, "lightbox-iframe-9e50d19b-40c1-4c94-9ca4-752b728e5569")
+                # Switch to the iframe
+                driver.switch_to.frame(iframe)
+                # Now you can interact with the modal close button
+                close_button = WebDriverWait(driver, 2).until(
+                    EC.element_to_be_clickable((By.XPATH, "//*[@aria-label='Close Modal']"))
+                )
+                close_button.click()
+                # After interacting with the iframe, you may want to switch back to the main document
+                driver.switch_to.default_content()
+            except:
+                print("Error")
 
-                if text and text not in seen_texts:
-                    seen_texts.add(text)
-                    print("Found:", text)
+            while time.time() < finish_time:
+                #Find the coupons
+                try:
+                    el = driver.find_element(By.ID, "changeText")
+                    text = el.text.strip()
+                    if text and text not in seen_texts:
+                        seen_texts.add(text)
+                        print("Found:", text)
+                except Exception:
+                    pass
+                time.sleep(1)
+            coupons = {c: parse_coupon(c) for c in seen_texts}
 
-            except Exception:
-                pass
+        #Scroll to the end of the page
+        last_height = driver.execute_script("return document.body.scrollHeight")
+        while True:
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(random.uniform(1.5, 3.0))  # random delay
+            new_height = driver.execute_script("return document.body.scrollHeight")
+            if new_height == last_height:
+                break
+            last_height = new_height
 
-            time.sleep(1)
+        # ------------------- Scrape Products -------------------
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.mx-2")))
+        products = driver.find_elements(By.CSS_SELECTOR, "div.mx-2")
+        length = len(products)
+        i+=1
+        print(f"Found {len(products)} products.")
+        Threshold_coupon = None
+        BOGO_Name = None
+        BOGO_Coupon = None
+        #Set applicable coupons for each product
+        for key, coupon in coupons.items():
+            if "BOGO" in key:
+                BOGO_Name = key
+                BOGO_Coupon = coupon
+        if BOGO_Name:
+            match = re.match(r".*?\*", BOGO_Name)
+            result = match.group(0) if match else BOGO_Name
+        else:
+            result = ""
 
-        coupons = {c: parse_coupon(c) for c in seen_texts}
+        for coupon in coupons.values():
+            if coupon['type'] == 'threshold_discount':
+                Threshold_coupon = coupon
 
-    # ------------------- Scroll to Load All Shoes -------------------
-    last_height = driver.execute_script("return document.body.scrollHeight")
+        for product in products:
+            try:
+                brand = product.find_element(By.CSS_SELECTOR, "h2.fs-5.fw-semibold.mb-0").text
+            except:
+                brand = "N/A"
 
+            if brand not in accepted_brands:
+                continue
 
-    while True:
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(random.uniform(1.5, 3.0))  # random delay
-
-        new_height = driver.execute_script("return document.body.scrollHeight")
-        if new_height == last_height:
-            break
-        last_height = new_height
-
-    # ------------------- Scrape Products -------------------
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.mx-2")))
-
-    products = driver.find_elements(By.CSS_SELECTOR, "div.mx-2")
-
-    length = len(products)
-    i+=1
-
-    print(f"Found {len(products)} products.")
-
-    Threshold_coupon = None
-
-    for key, coupon in coupons.items():
-        if "BOGO" in key:
-            BOGO_Name = key
-            BOGO_Coupon = coupon
-    match = re.match(r".*?\*", BOGO_Name)
-    result = match.group(0) if match else BOGO_Name
-
-    for coupon in coupons.values():
-        if coupon['type'] == 'threshold_discount':
-            Threshold_coupon = coupon
-
-    for product in products:
-        try:
-            brand = product.find_element(By.CSS_SELECTOR, "h2.fs-5.fw-semibold.mb-0").text
-        except:
-            brand = "N/A"
-
-        if brand not in accepted_brands:
-            continue
-
-        coupon_list = []
-
-        text = product.text
-
-        if result in text:
-            coupon_list.append(BOGO_Coupon)
-
-        if "Coupon eligible*" in text and Threshold_coupon:
-            coupon_list.append(Threshold_coupon)
-
-        if len(coupon_list) == 0:
-            continue
-
-        try:
-            name = product.find_element(By.CSS_SELECTOR, "h3.fs-6.text-truncate.fw-normal.mb-2").text
-        except:
-            name = "N/A"
-
-        try:
-            link = product.find_element(By.CSS_SELECTOR, 'a[data-test-a="productCardLink"]').get_attribute('href')
-        except:
-            link = "N/A"
-
-        shoe_data.append({
-            "brand": brand,
-            "name": name,
-            "link": link,
-            "coupons": coupon_list
-        })
-
-    print(len(shoe_data))
-
-print(shoe_data)
-end_time = time.time()
-
-# Calculate elapsed time
-elapsed_time = end_time - start_time
-print(f"Crawling process took {elapsed_time} seconds")
-brand_counts = Counter(shoe["brand"] for shoe in shoe_data)
-for brand in sorted(brand_counts):
-    print(brand, brand_counts[brand])
-
-final_shoe = []
-
-start_time = time.time()
-
-for shoe in shoe_data:
-
-    url = shoe["link"]
-
-    match = re.search(r'/(\d+)$', url)
-
-    if match:
-        final_number = match.group(1)
-    else:
-        print("No number found")
-
-    session = requests.Session()
-
-    # copy cookies from selenium
-    for cookie in driver.get_cookies():
-        session.cookies.set(cookie['name'], cookie['value'])
-
-    headers = {
-        "User-Agent": driver.execute_script("return navigator.userAgent;"),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.champssports.com/",
-    }
-
-    # try:
-    time.sleep(random.uniform(0.2, 0.6))
-    response = session.get(url, headers=headers)
-
-    if response.status_code == 200:
-        html = response.text
-    else:
-        print(f"Request failed: {response.status_code} | {shoe['link']}")
-        continue
-
-    match = re.search(r'<script id="serverApp-state" type="application/json">(.*?)</script>', html, re.DOTALL)
-
-    if match:
-        # The JSON is in the matched group
-        encoded_json = match.group(1)
-
-        # Fix custom entities (if any custom decoding is needed)
-        decoded_json = decode_custom_entities(encoded_json)
-
-        # Parse the JSON data
-        data = json.loads(decoded_json)
-
-        sizes = data["cx-state"]["product"]["details"]["entities"][final_number]["variants"]["value"]\
-            ["variantOptions"]
-
-        active_sizes = [
-            {
-                "size": s["size"],
-                "upc": s["vendorUPC"],
-                "og_price": s["priceData"]["value"]
-            }
-            for s in sizes
-            if s["pdpAvailability"].get("hasShippingAvailability") and s.get("vendorUPC")
-        ]
-
-        sale_price = active_sizes[0]['og_price'] if active_sizes else None
-        if not sale_price == None:
-            for coupon in shoe['coupons']:
-                sale_price = apply_coupon(sale_price, coupon)
-            sale_price = round(sale_price, 2)
-
-        for final in active_sizes:
-            final_shoe.append({
-                "UPC": final["upc"],
-                "name": shoe['name'],
-                "bogo_price": sale_price,
-                "link": shoe['link'],
-                "size": final["size"],
-                "og_price": final['og_price'],
-                "brand": shoe["brand"],
-                "coupons": shoe["coupons"]
+            coupon_list = []
+            text = product.text
+            #Search for information that we are looking for
+            if result in text:
+                coupon_list.append(BOGO_Coupon)
+            if "Coupon eligible*" in text and Threshold_coupon:
+                coupon_list.append(Threshold_coupon)
+            if len(coupon_list) == 0:
+                continue
+            try:
+                name = product.find_element(By.CSS_SELECTOR, "h3.fs-6.text-truncate.fw-normal.mb-2").text
+            except:
+                name = "N/A"
+            try:
+                link = product.find_element(By.CSS_SELECTOR, 'a[data-test-a="productCardLink"]').get_attribute('href')
+            except:
+                link = "N/A"
+            #Adds shoe to spreadsheet
+            shoe_data.append({
+                "brand": brand,
+                "name": name,
+                "link": link,
+                "coupons": coupon_list
             })
 
-end_time = time.time()
+        print(len(shoe_data))
 
-# Calculate elapsed time
-elapsed_time = end_time - start_time
-print(f"Speed process took {elapsed_time} seconds")
+    print(shoe_data)
+    end_time = time.time()
+    #Calculate how long the scrape took
+    elapsed_time = end_time - start_time
+    print(f"Crawling process took {elapsed_time} seconds")
+    brand_counts = Counter(shoe["brand"] for shoe in shoe_data)
+    for brand in sorted(brand_counts):
+        print(brand, brand_counts[brand])
+    final_shoe = []
+    start_time = time.time()
+    #Get more information for each shoe
+    for shoe in shoe_data:
+        last_product = product
+        url = shoe["link"]
+        match = re.search(r'/(\d+)$', url)
+        if match:
+            final_number = match.group(1)
+        else:
+            print("No number found")
+        session = requests.Session()
+        # copy cookies from selenium
+        for cookie in driver.get_cookies():
+            session.cookies.set(cookie['name'], cookie['value'])
+        headers = {
+            "User-Agent": driver.execute_script("return navigator.userAgent;"),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.champssports.com/",
+        }
+        time.sleep(random.uniform(0.2, 0.6))
+        response = session.get(url, headers=headers)
+        if response.status_code == 200:
+            html = response.text
+        else:
+            print(f"Request failed: {response.status_code} | {shoe['link']}")
+            continue
+        match = re.search(r'<script id="serverApp-state" type="application/json">(.*?)</script>', html, re.DOTALL)
+        if match:
+            #If we find more information we add it to the object
+            encoded_json = match.group(1)
+            decoded_json = decode_custom_entities(encoded_json)
+            data = json.loads(decoded_json)
+            sizes = data["cx-state"]["product"]["details"]["entities"][final_number]["variants"]["value"]\
+                ["variantOptions"]
+            active_sizes = [
+                {
+                    "size": s["size"],
+                    "upc": s["vendorUPC"],
+                    "og_price": s["priceData"]["value"]
+                }
+                for s in sizes
+                if s["pdpAvailability"].get("hasShippingAvailability") and s.get("vendorUPC")
+            ]
+            #Calculate sale price with coupons
+            sale_price = active_sizes[0]['og_price'] if active_sizes else None
+            if not sale_price == None:
+                for coupon in shoe['coupons']:
+                    sale_price = apply_coupon(sale_price, coupon)
+                sale_price = round(sale_price, 2)
+            for final in active_sizes:
+                final_shoe.append({
+                    "UPC": final["upc"],
+                    "name": shoe['name'],
+                    "bogo_price": sale_price,
+                    "link": shoe['link'],
+                    "size": final["size"],
+                    "og_price": final['og_price'],
+                    "brand": shoe["brand"],
+                    "coupons": shoe["coupons"]
+                })
+    #Calculate final time taken
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"Speed process took {elapsed_time} seconds")
+    #Make the spreadsheet and upload it to drive
+    current_datetime = datetime.now()
+    datetime_string = current_datetime.strftime("%m-%d-%Y %H:%M")
+    df = pd.DataFrame(final_shoe)
+    rr_name = "RackRoom "+datetime_string
+    df.to_csv(rr_name+".csv", index=False)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
+    client = gspread.authorize(creds)
+    # Open spreadsheet
+    spreadsheet = client.open("Francis - Web Scraping")
+    def create_and_fill_sheet(spreadsheet, title, df):
+        rows, cols = df.shape
 
-current_datetime = datetime.now()
+        # +1 for header row, + a little buffer
+        worksheet = spreadsheet.add_worksheet(
+            title=title,
+            rows=str(rows + 1),
+            cols=str(cols)
+        )
 
-# Convert it to a string (default format)
-datetime_string = current_datetime.strftime("%m-%d-%Y %H:%M")
+        set_with_dataframe(worksheet, df)
+        return worksheet
+    rr_sheet = create_and_fill_sheet(spreadsheet, rr_name, df)
+    driver.quit()
+    print("CSV saved!")
+    send_error_email("Rack Room scraper finished successfully at " + datetime_string)
 
-df = pd.DataFrame(final_shoe)
-
-rr_name = "RackRoom "+datetime_string
-
-# Save to CSV
-df.to_csv(rr_name+".csv", index=False)
-
-scopes = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
-creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
-client = gspread.authorize(creds)
-
-# Open spreadsheet
-spreadsheet = client.open("Francis - Web Scraping")
-
-def create_and_fill_sheet(spreadsheet, title, df):
-    rows, cols = df.shape
-
-    # +1 for header row, + a little buffer
-    worksheet = spreadsheet.add_worksheet(
-        title=title,
-        rows=str(rows + 1),
-        cols=str(cols)
-    )
-
-    set_with_dataframe(worksheet, df)
-    return worksheet
-
-rr_sheet = create_and_fill_sheet(spreadsheet, rr_name, df)
-
-driver.quit()
-
-
-print("CSV saved!")
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        error_text = traceback.format_exc()
+        print(error_text)
+        send_error_email(error_text, last_product)
+        raise
